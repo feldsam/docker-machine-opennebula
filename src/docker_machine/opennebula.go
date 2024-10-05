@@ -1,14 +1,19 @@
 package opennebula
 
 import (
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"net"
 	"strconv"
 	"time"
 
-	"github.com/OpenNebula/goca"
+	"github.com/OpenNebula/one/src/oca/go/src/goca"
+	"github.com/OpenNebula/one/src/oca/go/src/goca/schemas/shared"
+	shared_schemas "github.com/OpenNebula/one/src/oca/go/src/goca/schemas/shared"
+	vm_schemas "github.com/OpenNebula/one/src/oca/go/src/goca/schemas/vm"
+	"github.com/OpenNebula/one/src/oca/go/src/goca/schemas/vm/keys"
+
 	"github.com/docker/machine/libmachine/drivers"
 	"github.com/docker/machine/libmachine/log"
 	"github.com/docker/machine/libmachine/mcnflag"
@@ -37,15 +42,16 @@ type Driver struct {
 	Xmlrpcurl      string
 	Config         goca.OneConfig
 	DisableVNC     bool
+	StartRetries   string
+	MachineId      int
 }
 
 const (
-	defaultTimeout = 1 * time.Second
-	defaultSSHUser = "docker"
-	defaultCPU     = "1"
-	defaultVCPU    = "1"
-	defaultMemory  = "1024"
-
+	defaultSSHUser      = "docker"
+	defaultCPU          = "1"
+	defaultVCPU         = "1"
+	defaultMemory       = "1024"
+	defaultStartRetries = "600"
 	// This is the contextualization script that will be executed by OpenNebula
 	contextScript = `#!/bin/sh
 
@@ -102,9 +108,11 @@ func (d *Driver) buildConfig() {
 	d.Config = goca.NewConfig(d.User, d.Password, d.Xmlrpcurl)
 }
 
-func (d *Driver) setClient() error {
+func (d *Driver) getController() *goca.Controller {
 	d.buildConfig()
-	return goca.SetClient(d.Config)
+	client := goca.NewDefaultClient(d.Config)
+
+	return goca.NewController(client)
 }
 
 // GetCreateFlags registers the flags this driver adds to
@@ -221,6 +229,12 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			Usage:  "Set the url for one xmlrpc server",
 			EnvVar: "ONE_XMLRPC",
 		},
+		mcnflag.StringFlag{
+			Name:   "opennebula-start-retries",
+			Usage:  "Set the number of retries until de vm is running",
+			EnvVar: "ONE_START_RETRIES",
+			Value:  defaultStartRetries,
+		},
 	}
 }
 
@@ -260,6 +274,9 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 
 	// VNC
 	d.DisableVNC = flags.Bool("opennebula-disable-vnc")
+
+	// CONFIG
+	d.StartRetries = flags.String("opennebula-start-retries")
 
 	// Either TemplateName or TemplateID
 	if d.TemplateName != "" && d.TemplateID != "" {
@@ -339,26 +356,15 @@ func (d *Driver) GetSSHHostname() (string, error) {
 	return d.GetIP()
 }
 
-func (d *Driver) GetSSHUsername() string {
-	return d.SSHUser
-}
-
-func (d *Driver) PreCreateCheck() error {
-	return nil
-}
-
 func (d *Driver) Create() error {
-	var (
-		vector     *goca.TemplateBuilderVector
-		vmtemplate *goca.Template
+	var err error
 
-		err error
-	)
+	var instanceID = -1
 
 	// build config and set the xmlrpc client
-	d.setClient()
+	controller := d.getController()
 
-	log.Infof("Creating SSH key..")
+	log.Infof("Creating SSH key...")
 	if err := ssh.GenerateSSHKey(d.GetSSHKeyPath()); err != nil {
 		return err
 	}
@@ -369,149 +375,181 @@ func (d *Driver) Create() error {
 	}
 
 	// Create template
-	template := goca.NewTemplateBuilder()
+	template := vm_schemas.NewTemplate()
 
 	if d.TemplateName != "" || d.TemplateID != "" {
 		// Template has been specified
 	} else {
 		// Template has NOT been specified
-		template.AddValue("NAME", d.MachineName)
+		template.Add(keys.Name, d.MachineName)
 
 		// OS Boot
-		vector = template.NewVector("OS")
-		vector.AddValue("BOOT", "disk0")
+		template.AddOS(keys.Boot, "disk0")
 
 		// OS Disk
-		vector = template.NewVector("DISK")
+		disk := template.AddDisk()
 
 		if d.ImageID != "" {
-			vector.AddValue("IMAGE_ID", d.ImageID)
+			disk.Add(shared.ImageID, d.ImageID)
 		} else {
-			vector.AddValue("IMAGE", d.ImageName)
+			disk.Add(shared.Image, d.ImageName)
 			if d.ImageOwner != "" {
-				vector.AddValue("IMAGE_UNAME", d.ImageOwner)
+				disk.Add(shared.ImageUname, d.ImageOwner)
 			}
 		}
 
 		if d.DiskSize != "" {
-			vector.AddValue("SIZE", d.DiskSize)
+			disk.Add(shared.Size, d.DiskSize)
 		}
 
 		if d.ImageDevPrefix != "" {
-			vector.AddValue("DEV_PREFIX", d.ImageDevPrefix)
+			disk.Add(shared.DevPrefix, d.ImageDevPrefix)
 		}
 
 		// Add a volatile disk for b2d
 		if d.B2DSize != "" {
-			vector = template.NewVector("DISK")
-			vector.AddValue("SIZE", d.B2DSize)
-			vector.AddValue("TYPE", "fs")
-			vector.AddValue("FORMAT", "raw")
+			vdisk := template.AddDisk()
+			vdisk.Add(shared.Size, d.B2DSize)
+			vdisk.Add("TYPE", "fs")
+			vdisk.Add("FORMAT", "raw")
 		}
 
 		// VNC
 		if !d.DisableVNC {
-			vector = template.NewVector("GRAPHICS")
-			vector.AddValue("LISTEN", "0.0.0.0")
-			vector.AddValue("TYPE", "vnc")
+			template.AddIOGraphic(keys.Listen, "0.0.0.0")
+			template.AddIOGraphic(keys.GraphicType, "vnc")
 		}
 	}
 
 	// Capacity
 	if d.CPU != "" {
-		template.AddValue("CPU", d.CPU)
+		cpu, _ := strconv.ParseFloat(d.CPU, 64)
+		template.CPU(cpu)
 	}
 
 	if d.Memory != "" {
-		template.AddValue("MEMORY", d.Memory)
+		memory, _ := strconv.Atoi(d.Memory)
+		template.Memory(memory)
 	}
 
 	if d.VCPU != "" {
-		template.AddValue("VCPU", d.VCPU)
+		vcpu, _ := strconv.Atoi(d.VCPU)
+		template.VCPU(vcpu)
 	}
 
 	// Network
 	if d.NetworkName != "" || d.NetworkID != "" {
-		vector = template.NewVector("NIC")
+		nic := template.AddNIC()
 
 		if d.NetworkName != "" {
-			vector.AddValue("NETWORK", d.NetworkName)
+			nic.Add(shared.Network, d.NetworkName)
 			if d.NetworkOwner != "" {
-				vector.AddValue("NETWORK_UNAME", d.NetworkOwner)
+				nic.Add(shared.NetworkUName, d.NetworkOwner)
 			}
 		}
 
 		if d.NetworkID != "" {
-			vector.AddValue("NETWORK_ID", d.NetworkID)
+			nic.Add(shared.NetworkID, d.NetworkID)
 		}
 	}
 
 	// Context
-	vector = template.NewVector("CONTEXT")
-	vector.AddValue("NETWORK", "YES")
-	vector.AddValue("SSH_PUBLIC_KEY", "$USER[SSH_PUBLIC_KEY]")
-	vector.AddValue("DOCKER_SSH_USER", d.SSHUser)
-	vector.AddValue("DOCKER_SSH_PUBLIC_KEY", string(pubKey))
-	contextScript64 := base64.StdEncoding.EncodeToString([]byte(contextScript))
-	vector.AddValue("START_SCRIPT_BASE64", contextScript64)
+	template.AddCtx(keys.NetworkCtx, "YES")
+	template.AddCtx(keys.SSHPubKey, "$USER[SSH_PUBLIC_KEY]")
+	template.AddCtx("DOCKER_SSH_USER", d.SSHUser)
+	template.AddCtx("DOCKER_SSH_PUBLIC_KEY", string(pubKey))
+	template.AddB64Ctx(keys.StartScriptB64, contextScript)
 
 	// Instantiate
-	log.Infof("Starting	 VM..")
+	log.Infof("Starting	 VM...")
 
+	// Template has been specified
 	if d.TemplateName != "" || d.TemplateID != "" {
+		var templateID int
 
 		if d.TemplateName != "" {
-			vmtemplate, err = goca.NewTemplateFromName(d.TemplateName)
+			templateID, err = controller.Templates().ByName(d.TemplateName)
 			if err != nil {
 				return err
 			}
 		} else {
-			templateID, err := strconv.Atoi(d.TemplateID)
+			templateID, err = strconv.Atoi(d.TemplateID)
 			if err != nil {
 				return err
 			}
-			vmtemplate = goca.NewTemplate(uint(templateID))
 		}
 
-		_, err = vmtemplate.Instantiate(d.MachineName, false, template.String())
+		vmtemplate := controller.Template(templateID)
+
+		instanceID, err = vmtemplate.Instantiate(d.MachineName, false, template.String(), false)
 
 	} else {
-		_, err = goca.CreateVM(template.String(), false)
+		instanceID, err = controller.VMs().Create(template.String(), false)
 	}
 
 	if err != nil {
 		return err
 	}
 
-	if d.IPAddress, err = d.GetIP(); err != nil {
-		return err
-	}
+	d.MachineId = instanceID
 
 	return d.Start()
 }
 
 func (d *Driver) GetURL() (string, error) {
+	if err := drivers.MustBeRunning(d); err != nil {
+		return "", err
+	}
+
 	ip, err := d.GetIP()
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("tcp://%s:2376", ip), nil
+	if ip == "" {
+		return "", nil
+	}
+
+	return fmt.Sprintf("tcp://%s", net.JoinHostPort(ip, "2376")), nil
 }
 
 func (d *Driver) GetIP() (string, error) {
-	d.setClient()
-	vm, err := goca.NewVMFromName(d.MachineName)
+	if d.IPAddress != "" {
+		return d.IPAddress, nil
+	}
+
+	log.Debug("Looking for the IP address...")
+
+	controller := d.getController()
+
+	var err2 error
+	var vmId int
+
+	if d.MachineId == 0 {
+		vmId, err2 = controller.VMs().ByName(d.MachineName)
+		if err2 != nil {
+			return "", err2
+		}
+		d.MachineId = vmId
+	}
+
+	vm, err := controller.VM(d.MachineId).Info(false)
 	if err != nil {
 		return "", err
 	}
 
-	err = vm.Info()
-	if err != nil {
-		return "", err
-	}
+	if len(vm.Template.GetNICs()) > 0 {
+		// check first for External IP
+		ip, err := vm.Template.GetNICs()[0].Get(shared_schemas.ExternalIP)
 
-	if ip, ok := vm.XPath("/VM/TEMPLATE/NIC/IP"); ok {
-		d.IPAddress = ip
+		if err == nil && ip != "" {
+			d.IPAddress = ip
+		} else {
+			// check for IP (if External IP is not defined)
+			ip, err = vm.Template.GetNICs()[0].Get(shared_schemas.IP)
+			if err == nil && ip != "" {
+				d.IPAddress = ip
+			}
+		}
 	}
 
 	if d.IPAddress == "" {
@@ -522,13 +560,20 @@ func (d *Driver) GetIP() (string, error) {
 }
 
 func (d *Driver) GetState() (state.State, error) {
-	d.setClient()
-	vm, err := goca.NewVMFromName(d.MachineName)
-	if err != nil {
-		return state.None, err
+	controller := d.getController()
+
+	var err2 error
+	var vmId int
+
+	if d.MachineId == 0 {
+		vmId, err2 = controller.VMs().ByName(d.MachineName)
+		if err2 != nil {
+			return state.None, err2
+		}
+		d.MachineId = vmId
 	}
 
-	err = vm.Info()
+	vm, err := controller.VM(d.MachineId).Info(false)
 	if err != nil {
 		return state.None, err
 	}
@@ -560,7 +605,8 @@ func (d *Driver) GetState() (state.State, error) {
 			"HOTPLUG_NIC",
 			"HOTPLUG_SAVEAS",
 			"DISK_SNAPSHOT",
-			"DISK_SNAPSHOT_DELETE":
+			"DISK_SNAPSHOT_DELETE",
+			"HOTPLUG_RESIZE":
 
 			return state.Running, nil
 
@@ -580,8 +626,13 @@ func (d *Driver) GetState() (state.State, error) {
 
 		case "HOTPLUG_SAVEAS_POWEROFF",
 			"HOTPLUG_SAVEAS_SUSPENDED",
+			"HOTPLUG_SAVEAS_UNDEPLOYED",
+			"HOTPLUG_SAVEAS_STOPPED",
 			"HOTPLUG_PROLOG_POWEROFF",
 			"HOTPLUG_EPILOG_POWEROFF",
+			"HOTPLUG_NIC_POWEROFF",
+			"HOTPLUG_SNAPSHOT_POWEROFF",
+			"HOTPLUG_SNAPSHOT_UNDEPLOYED",
 			"PROLOG_MIGRATE_POWEROFF",
 			"PROLOG_MIGRATE_SUSPEND",
 			"DISK_SNAPSHOT_POWEROFF",
@@ -636,16 +687,28 @@ func (d *Driver) GetState() (state.State, error) {
 }
 
 func (d *Driver) Start() error {
-	d.setClient()
-	vm, err := goca.NewVMFromName(d.MachineName)
-	if err != nil {
-		return err
+	var err error
+
+	if drivers.MachineInState(d, state.Stopped)() {
+		controller := d.getController()
+
+		var vmId int
+
+		if d.MachineId == 0 {
+			vmId, err = controller.VMs().ByName(d.MachineName)
+			if err != nil {
+				return err
+			}
+			d.MachineId = vmId
+		}
+
+		vm := controller.VM(d.MachineId)
+		vm.Resume()
 	}
-
-	vm.Resume()
-
+	
 	s := state.None
-	for retry := 0; retry < 50 && s != state.Running; retry++ {
+	retries, _ := strconv.Atoi(d.StartRetries)
+	for retry := 0; retry < retries && s != state.Running; retry++ {
 		s, err = d.GetState()
 		if err != nil {
 			return err
@@ -653,7 +716,7 @@ func (d *Driver) Start() error {
 
 		switch s {
 		case state.Error:
-			return errors.New("vM in error state")
+			return errors.New("VM in error state")
 		default:
 			time.Sleep(2 * time.Second)
 		}
@@ -665,20 +728,28 @@ func (d *Driver) Start() error {
 		}
 	}
 
-	log.Infof("Waiting for SSH..")
+	log.Infof("Waiting for SSH...")
 
 	// Wait for SSH over NAT to be available before returning to user
 	return drivers.WaitForSSH(d)
 }
 
 func (d *Driver) Stop() error {
-	d.setClient()
-	vm, err := goca.NewVMFromName(d.MachineName)
-	if err != nil {
-		return err
+	controller := d.getController()
+
+	var err2 error
+	var vmId int
+
+	if d.MachineId == 0 {
+		vmId, err2 = controller.VMs().ByName(d.MachineName)
+		if err2 != nil {
+			return err2
+		}
+		d.MachineId = vmId
 	}
 
-	err = vm.Poweroff()
+	vm := controller.VM(d.MachineId)
+	err := vm.Poweroff()
 	if err != nil {
 		return err
 	}
@@ -687,13 +758,21 @@ func (d *Driver) Stop() error {
 }
 
 func (d *Driver) Remove() error {
-	d.setClient()
-	vm, err := goca.NewVMFromName(d.MachineName)
-	if err != nil {
-		return err
+	controller := d.getController()
+
+	var err2 error
+	var vmId int
+
+	if d.MachineId == 0 {
+		vmId, err2 = controller.VMs().ByName(d.MachineName)
+		if err2 != nil {
+			return err2
+		}
+		d.MachineId = vmId
 	}
 
-	err = vm.TerminateHard()
+	vm := controller.VM(d.MachineId)
+	err := vm.TerminateHard()
 	if err != nil {
 		return err
 	}
@@ -702,13 +781,21 @@ func (d *Driver) Remove() error {
 }
 
 func (d *Driver) Restart() error {
-	d.setClient()
-	vm, err := goca.NewVMFromName(d.MachineName)
-	if err != nil {
-		return err
+	controller := d.getController()
+
+	var err2 error
+	var vmId int
+
+	if d.MachineId == 0 {
+		vmId, err2 = controller.VMs().ByName(d.MachineName)
+		if err2 != nil {
+			return err2
+		}
+		d.MachineId = vmId
 	}
 
-	err = vm.Reboot()
+	vm := controller.VM(d.MachineId)
+	err := vm.Reboot()
 	if err != nil {
 		return err
 	}
@@ -717,13 +804,26 @@ func (d *Driver) Restart() error {
 }
 
 func (d *Driver) Kill() error {
-	d.setClient()
-	vm, err := goca.NewVMFromName(d.MachineName)
+	controller := d.getController()
+
+	var err2 error
+	var vmId int
+
+	if d.MachineId == 0 {
+		vmId, err2 = controller.VMs().ByName(d.MachineName)
+		if err2 != nil {
+			return err2
+		}
+		d.MachineId = vmId
+	}
+
+	vm := controller.VM(d.MachineId)
+	err := vm.PoweroffHard()
 	if err != nil {
 		return err
 	}
 
-	return vm.PoweroffHard()
+	return nil
 }
 
 func (d *Driver) publicSSHKeyPath() string {

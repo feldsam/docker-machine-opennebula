@@ -28,15 +28,13 @@ This is a plugin for [Docker Machine](https://docs.docker.com/machine/) allowing
 
 Make sure [Go](http://www.golang.org) and [Godep](https://github.com/tools/godep) are properly installed, including setting up a [GOPATH](http://golang.org/doc/code.html#GOPATH).
 
-To build the plugin binary:
+To build the plugin binaries using docker:
 
 ```bash
-$ go get github.com/OpenNebula/docker-machine-opennebula
-$ cd $GOPATH/src/github.com/OpenNebula/docker-machine-opennebula
-$ make build
+$ docker build --output=bin .
 ```
 
-After the build is complete, `bin/docker-machine-driver-opennebula` binary will be created and it must included in `$PATH` variable. If you want to copy it to the `${GOPATH}/bin/`, run `make install`.
+After the build is complete, `bin/docker-machine-driver-opennebula` binary will be created and it must included in `$PATH` variable.
 
 ## Usage
 
