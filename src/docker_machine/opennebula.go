@@ -36,7 +36,6 @@ type Driver struct {
 	Memory         string
 	DiskSize       string
 	ImageDevPrefix string
-	B2DSize        string
 	User           string
 	Password       string
 	Xmlrpcurl      string
@@ -55,30 +54,25 @@ const (
 	// This is the contextualization script that will be executed by OpenNebula
 	contextScript = `#!/bin/sh
 
-if [ -f /etc/boot2docker ]; then
-	USERNAME=docker
-	USER_HOME=/home/docker
+USERNAME=$DOCKER_SSH_USER
+GROUPNAME=$DOCKER_SSH_USER
+
+if ! getent group $GROUPNAME; then
+	groupadd $GROUPNAME
+fi
+
+if ! getent passwd $USERNAME; then
+	USER_HOME=/var/lib/$DOCKER_SSH_USER
+	useradd -m -d $USER_HOME -g $USERNAME $GROUPNAME
 else
-	USERNAME=$DOCKER_SSH_USER
-	GROUPNAME=$DOCKER_SSH_USER
+	USER_HOME=$(getent passwd $USERNAME | cut -d: -f 6)
+fi
 
-	if ! getent group $GROUPNAME; then
-		groupadd $GROUPNAME
-	fi
-
-	if ! getent passwd $USERNAME; then
-		USER_HOME=/var/lib/$DOCKER_SSH_USER
-		useradd -m -d $USER_HOME -g $USERNAME $GROUPNAME
-	else
-		USER_HOME=$(getent passwd $USERNAME | cut -d: -f 6)
-	fi
-
-	# Write sudoers
-	if [ ! -f /etc/sudoers.d/$USERNAME ]; then
-		echo -n "Defaults:$USERNAME " >> /etc/sudoers.d/$USERNAME
-		echo '!requiretty' >> /etc/sudoers.d/$USERNAME
-		echo "$USERNAME ALL=(ALL:ALL) NOPASSWD: ALL" >> /etc/sudoers.d/$USERNAME
-	fi
+# Write sudoers
+if [ ! -f /etc/sudoers.d/$USERNAME ]; then
+	echo -n "Defaults:$USERNAME " >> /etc/sudoers.d/$USERNAME
+	echo '!requiretty' >> /etc/sudoers.d/$USERNAME
+	echo "$USERNAME ALL=(ALL:ALL) NOPASSWD: ALL" >> /etc/sudoers.d/$USERNAME
 fi
 
 # Add DOCKER_SSH_PUBLIC_KEY
@@ -198,12 +192,6 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			Value:  "",
 		},
 		mcnflag.StringFlag{
-			Name:   "opennebula-b2d-size",
-			Usage:  "Size of the Volatile disk in MB (only for b2d)",
-			EnvVar: "ONE_B2D_DATA_SIZE",
-			Value:  "",
-		},
-		mcnflag.StringFlag{
 			Name:   "opennebula-ssh-user",
 			Usage:  "Set the name of the SSH user",
 			EnvVar: "ONE_SSH_USER",
@@ -267,7 +255,6 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 
 	d.ImageDevPrefix = flags.String("opennebula-dev-prefix")
 	d.DiskSize = flags.String("opennebula-disk-resize")
-	d.B2DSize = flags.String("opennebula-b2d-size")
 
 	// Provision
 	d.SSHUser = flags.String("opennebula-ssh-user")
@@ -308,10 +295,6 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 		}
 		// DiskSize is incompatible
 		if d.DiskSize != "" {
-			return errors.New("option: --opennebula-disk-resize is incompatible with --opennebula-template-*")
-		}
-		// B2DSize is incompatible
-		if d.B2DSize != "" {
 			return errors.New("option: --opennebula-disk-resize is incompatible with --opennebula-template-*")
 		}
 		// DisableVNC is incompatible
@@ -404,14 +387,6 @@ func (d *Driver) Create() error {
 
 		if d.ImageDevPrefix != "" {
 			disk.Add(shared.DevPrefix, d.ImageDevPrefix)
-		}
-
-		// Add a volatile disk for b2d
-		if d.B2DSize != "" {
-			vdisk := template.AddDisk()
-			vdisk.Add(shared.Size, d.B2DSize)
-			vdisk.Add("TYPE", "fs")
-			vdisk.Add("FORMAT", "raw")
 		}
 
 		// VNC
