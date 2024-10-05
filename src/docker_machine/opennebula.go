@@ -62,10 +62,7 @@ if ! getent group $GROUPNAME; then
 fi
 
 if ! getent passwd $USERNAME; then
-	USER_HOME=/var/lib/$DOCKER_SSH_USER
-	useradd -m -d $USER_HOME -g $USERNAME $GROUPNAME
-else
-	USER_HOME=$(getent passwd $USERNAME | cut -d: -f 6)
+	useradd -m -d /var/lib/$USERNAME -g $USERNAME $GROUPNAME
 fi
 
 # Write sudoers
@@ -75,17 +72,22 @@ if [ ! -f /etc/sudoers.d/$USERNAME ]; then
 	echo "$USERNAME ALL=(ALL:ALL) NOPASSWD: ALL" >> /etc/sudoers.d/$USERNAME
 fi
 
+# Configure special location for ssh pub key
+if ! grep -q 'Match User docker' /etc/ssh/sshd_config; then
+    echo -e 'Match User docker\n\tAuthorizedKeysFile /etc/authorized_keys/%u' >> /etc/ssh/sshd_config
+    service sshd restart
+fi
+
 # Add DOCKER_SSH_PUBLIC_KEY
 
-AUTH_DIR="${USER_HOME}/.ssh"
-AUTH_FILE="${AUTH_DIR}/authorized_keys"
+AUTH_DIR="/etc/authorized_keys"
+AUTH_FILE="${AUTH_DIR}/${USERNAME}"
 
-mkdir -m0700 -p $AUTH_DIR
+mkdir -m0755 -p $AUTH_DIR
 
 echo "$DOCKER_SSH_PUBLIC_KEY" >> $AUTH_FILE
 
-chown "${USERNAME}": ${AUTH_DIR} ${AUTH_FILE}
-chmod 600 $AUTH_FILE`
+chmod 644 $AUTH_FILE`
 )
 
 func NewDriver(hostName, storePath string) *Driver {
@@ -680,7 +682,7 @@ func (d *Driver) Start() error {
 		vm := controller.VM(d.MachineId)
 		vm.Resume()
 	}
-	
+
 	s := state.None
 	retries, _ := strconv.Atoi(d.StartRetries)
 	for retry := 0; retry < retries && s != state.Running; retry++ {
