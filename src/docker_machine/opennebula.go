@@ -541,14 +541,29 @@ func (d *Driver) GetState() (state.State, error) {
 	var vmId int
 
 	if d.MachineId == 0 {
-		vmId, err2 = controller.VMs().ByName(d.MachineName)
+		for i := 0; i < 5; i++ {
+			vmId, err2 = controller.VMs().ByName(d.MachineName)
+			if err2 == nil {
+				break // Success!
+			}
+			time.Sleep(2 * time.Second)
+		}
 		if err2 != nil {
 			return state.None, err2
 		}
 		d.MachineId = vmId
 	}
 
-	vm, err := controller.VM(d.MachineId).Info(false)
+	var err error
+	var vm *vm_schemas.VM
+
+	for i := 0; i < 5; i++ {
+		vm, err = controller.VM(d.MachineId).Info(false)
+		if err == nil {
+			break // Success!
+		}
+		time.Sleep(2 * time.Second)
+	}
 	if err != nil {
 		return state.None, err
 	}
